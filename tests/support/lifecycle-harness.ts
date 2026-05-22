@@ -79,7 +79,7 @@ export function createStrictLifecycleHarness(
     onPlanSubmitted: (_plan, steps) => lifecycle.recordPlanProposed(steps),
     onStepCompleted: (completion) => completions.push(completion),
   });
-  registerMutationTools(registry, opts);
+  registerLifecycleToolFixtures(registry, opts);
 
   return {
     lifecycle,
@@ -103,7 +103,7 @@ export function createStrictLifecycleHarness(
   };
 }
 
-function registerMutationTools(
+function registerLifecycleToolFixtures(
   registry: ToolRegistry,
   opts: StrictLifecycleHarnessOptions = {},
 ): void {
