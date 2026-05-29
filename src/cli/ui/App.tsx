@@ -91,6 +91,8 @@ import {
   shouldAutoNameSession,
 } from "../../session-title.js";
 import { loadSlashUsage, recordSlashUse } from "../../slash-usage.js";
+import type { TelegramChannel } from "../../telegram/channel.js";
+import { useTelegramChannel } from "../../telegram/use-telegram-channel.js";
 import { type SessionSummary, resolveContextTokens } from "../../telemetry/stats.js";
 import { defaultUsageLogPath } from "../../telemetry/usage.js";
 import { warmupTokenizer } from "../../tokenizer.js";
@@ -307,10 +309,13 @@ export interface AppProps {
   startupInfoHints?: string[];
   /** Pre-created QQ channel (started before TUI mounts). */
   qqChannel?: QQChannel;
+  telegramChannel?: TelegramChannel;
   /** Ref filled by App on mount so QQ messages flow into the TUI input queue. */
   qqSubmitRef?: { current: ((text: string) => void) | null };
   /** Ref filled by App on mount so QQ errors appear in the TUI log. */
   qqErrorRef?: { current: ((msg: string) => void) | null };
+  telegramSubmitRef?: { current: ((text: string) => void) | null };
+  telegramErrorRef?: { current: ((msg: string) => void) | null };
   /** Resolved chat-history scroll mode, computed by the launcher from config/env. */
   historyScrollMode?: ResolvedHistoryScrollMode;
 }
@@ -459,8 +464,11 @@ function AppInner({
   onSwitchSession,
   startupInfoHints,
   qqChannel,
+  telegramChannel,
   qqSubmitRef,
   qqErrorRef,
+  telegramSubmitRef,
+  telegramErrorRef,
   historyScrollMode,
   themeName,
   setThemeName,
@@ -2712,11 +2720,41 @@ function AppInner({
     onChoiceResolveRef: handleChoiceResolveRef,
   });
 
+  const telegram = useTelegramChannel({
+    codeMode: !!codeMode,
+    initialChannel: telegramChannel,
+    log,
+    setQueuedSubmit,
+    telegramSubmitRef,
+    telegramErrorRef,
+    sessionName: session,
+    currentRootDir,
+    pendingGateIdRef,
+    completedStepIdsRef,
+    planStepsRef,
+    onCreateSession: onSwitchSession ? (name) => onSwitchSession(name) : undefined,
+    onSelectSession: onSwitchSession ? (name) => onSwitchSession(name) : undefined,
+    onModelPick: handleQQModelPick,
+    onThemePick: handleQQThemePick,
+    onShellConfirmRef: handleShellConfirmRef,
+    onPathConfirmRef: handlePathConfirmRef,
+    onPlanCancelRef: handlePlanCancelRef,
+    onPlanFeedbackRef: handlePlanFeedbackRef,
+    onCheckpointConfirmRef: handleCheckpointConfirmRef,
+    onCheckpointReviseRef: handleCheckpointReviseSubmitRef,
+    onPlanRevisionRef: handleReviseConfirmRef,
+    onChoiceResolveRef: handleChoiceResolveRef,
+  });
+
   const handleSubmit = useCallback(
     async (raw: string) => {
-      const incoming = qq.parseSubmit(raw);
+      const qqIncoming = qq.parseSubmit(raw);
+      const incoming =
+        qqIncoming?.handled || qqIncoming?.fromQQ ? qqIncoming : telegram.parseSubmit(raw);
       if (!incoming) return;
-      let { text, fromQQ } = incoming;
+      let { text } = incoming;
+      const fromQQ = "fromQQ" in incoming && incoming.fromQQ;
+      const fromTelegram = "fromTelegram" in incoming && incoming.fromTelegram;
       if (incoming.handled) {
         return;
       }
@@ -2958,12 +2996,17 @@ function AppInner({
             disconnect: qq.disconnect,
             status: qq.status,
           },
+          telegram: {
+            connect: telegram.connect,
+            disconnect: telegram.disconnect,
+            status: telegram.status,
+          },
           sessionId: session,
           getEngineeringLifecycleSnapshot: codeMode
             ? () => engineeringLifecycleRef.current?.snapshot() ?? null
             : undefined,
           jobs: codeMode?.jobs,
-          postInfo: fromQQ ? qq.sendInfo : log.pushInfo,
+          postInfo: fromQQ ? qq.sendInfo : fromTelegram ? telegram.sendInfo : log.pushInfo,
           postDoctor: (checks) => log.showDoctor(checks),
           postUsage: (args) => log.showUsageVerbose(args),
           postKeys: (args) =>
@@ -3023,8 +3066,7 @@ function AppInner({
           generateSessionTitle: generateCurrentSessionTitle,
         });
         if (
-          fromQQ &&
-          qq.handleRemoteSlashResult({
+          (fromQQ ? qq : fromTelegram ? telegram : null)?.handleRemoteSlashResult({
             result,
             codeMode: !!codeMode,
             sessions: listSessionsForWorkspace(currentRootDir),
@@ -3112,6 +3154,7 @@ function AppInner({
           text,
         });
         if (fromQQ && result.info) qq.sendText(result.info);
+        if (fromTelegram && result.info) telegram.sendText(result.info);
         if (outcome.kind === "resubmit") {
           text = outcome.text;
         } else {
@@ -3204,6 +3247,7 @@ function AppInner({
       busyRef.current = true;
       setBusy(true);
       qq.noteTurnFromQQ(fromQQ);
+      telegram.noteTurnFromTelegram(fromTelegram);
       abortedThisTurn.current = false;
       // Seal the in-progress history entry so this turn's edits open
       // a new one —prior turns are preserved intact for /history and
@@ -3470,6 +3514,7 @@ function AppInner({
           }
         }
         qq.maybeSendFinalReply(lastAssistantText);
+        telegram.maybeSendFinalReply(lastAssistantText);
       } finally {
         flush();
         // Esc aborted the turn —close any in-flight cards (streaming /
@@ -3485,6 +3530,7 @@ function AppInner({
         setBusy(false);
         submittingRef.current = false;
         qq.clearTurnReply();
+        telegram.clearTurnReply();
         // Refresh balance lazily —don't block the return.
         refreshBalance();
       }
@@ -3540,6 +3586,7 @@ function AppInner({
       startLoop,
       getLoopStatus,
       qq,
+      telegram,
       isLoopActive,
       isLoopFiring,
       clearFiringFlag,
@@ -3640,8 +3687,9 @@ function AppInner({
     setStagedCheckpointRevise(null);
     pendingGateIdRef.current = null;
     qq.resetInteractions();
+    telegram.resetInteractions();
     pauseGate.cancelAll();
-  }, [qq]);
+  }, [qq, telegram]);
 
   // Drain queued submits after the in-flight turn tears down.
   // QQ pause-gate replies are the one exception: they need to re-enter
@@ -3649,13 +3697,13 @@ function AppInner({
   // pauseGate.ask() can be resolved from the remote reply.
   useEffect(() => {
     if (queuedSubmit === null) return;
-    const canBypassBusy = qq.canBypassBusy(queuedSubmit);
+    const canBypassBusy = qq.canBypassBusy(queuedSubmit) || telegram.canBypassBusy(queuedSubmit);
     if ((!busy && !submittingRef.current) || canBypassBusy) {
       const text = queuedSubmit;
       setQueuedSubmit(null);
       void handleSubmit(text);
     }
-  }, [busy, queuedSubmit, handleSubmit, qq]);
+  }, [busy, queuedSubmit, handleSubmit, qq, telegram]);
 
   /**
    * PlanConfirm callback. Three outcomes, all ending with a synthetic
@@ -3917,6 +3965,7 @@ function AppInner({
       pendingGateIdRef.current = request.id;
 
       qq.handlePauseRequest(request.kind, payload);
+      telegram.handlePauseRequest(request.kind, payload);
 
       switch (request.kind) {
         case "run_command":
